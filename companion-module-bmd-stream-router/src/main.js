@@ -101,12 +101,18 @@ class StreamRouterInstance extends InstanceBase {
 	collectVariables() {
 		const vars = {}
 		const { sources, destinations } = this.endpoints()
+		vars['router_name'] = (this.state && this.state.name) || ''
+		vars['router_region'] = (this.state && this.state.region) || ''
+		vars['route_count'] = String((this.state && this.state.routes || []).length)
 		destinations.forEach((d, i) => {
 			const rt = this.routeFor(d.id)
-			vars[`dest_${i + 1}_source`] = rt ? this.sourceName(rt.source) : ''
 			vars[`dest_${i + 1}_name`] = d.name
+			vars[`dest_${i + 1}_source`] = rt ? this.sourceName(rt.source) : ''
+			vars[`dest_${i + 1}_source_id`] = rt ? rt.source : ''
+			vars[`dest_${i + 1}_status`] = (d.status || '').replace('STATUS_', '').toLowerCase()
 		})
 		sources.forEach((s, i) => {
+			vars[`input_${i + 1}_name`] = s.name
 			vars[`input_${i + 1}_status`] = (s.status || '').replace('STATUS_', '').toLowerCase()
 		})
 		return vars

@@ -244,15 +244,26 @@ Monitor: BMD's parser treats every headered chunk as a new message head.**
 
 - class 0 — `"BTST"` stream table: `"BTST" + 00000100` + 16-byte entries
   (video `[u32 0x30][u32 1][fourCC "H264"/"H265"][u32 0]`, audio
-  `[0][0]["aac "][0]`), padded to 16. Re-send every ~50 frames.
+  `[0][0]["aac "][0]`), padded to 16. Word 1 (`00000100`) is a generation
+  counter the receiver compares against its state — Resolve sends
+  `00000100` on every table, so a constant works. Re-send every ~50 frames.
 - class 1 — one video message per frame:
   `[u32 LE ts = PTS_90kHz<<2][12 zero bytes][u32 LE outer = section_len |
   0x80000000 for keyframes][section]`, section = concatenated
   `[u32 BE nal_len][bare NAL]` (no Annex-B start codes). A GOP message is
   VPS+SPS+PPS+IDR **in one message**; P messages are a single TRAIL slice.
-  Timestamps run at 360 kHz.
+  Timestamps run at 360 kHz. Note the receiver counts SECTION bytes only:
+  the head chunk's 20-byte message header is not part of `outer`.
 - class 2 — one audio message per ADTS frame:
   `[u32 LE ts][u32 0][u32 LE len][ADTS frame]`.
+
+**Receiver chunk dispatch** (as implemented in BMD's parser): each 4-byte
+header is classified by its top two bits — `0b11` (bit31+last) = complete
+single-chunk message; `0b10` (bit31, no last) = multi-chunk head; a
+continuation whose length field carries the `0x4000` bit = final chunk
+(completes the unit); continuations without it append to the open unit.
+Continuations address the unit by the *class* byte (their first byte is the
+class, not a magic).
 
 The router forwards messages **verbatim** (live-verified: every unique chunk
 body sent re-arrived byte-identical, keyframes included). It does not parse
@@ -276,6 +287,35 @@ output tiles light. Rules the bridge enforces:
   prefer closed GOP in the encoder (`x265: open-gop=0`; OBS/NVENC defaults
   are closed). RASL/RADL (8/9) leading pictures are dropped.
 - Strip SEI and AUD NALs. Emit paramsets + IDR as ONE class-1 message.
+
+#### Implementation checklist (writing your own encoder/viewer)
+
+Everything above, compressed to the order a new implementation needs it:
+
+1. **Login** (§3) → bearer token; **claim** an input (§4, handle the
+   200-empty "occupied" reply); **Connect** → host:port / claim / secret /
+   expiry; build streamid `#!::s=<expiry>,u=<claim>`; passphrase = secret.
+2. **SRT handshake** (§6): induction, conclusion v5 with HSREQ
+   `00010500000000bf008b008b` + SID + KMREQ (PBKEYLEN 16) + the 24-byte
+   `0xBD01` announce. No announce → handshake completes but nothing routes.
+3. **Flow control**: full ACKs arrive ~every 2 ms; header `info` is an ACK
+   *event counter* — the data ack is payload word 0 (`last_ack`, your own
+   ISN space). Track un-acked = (sent − (last_ack − ISN)); keep it small;
+   ACKACK (type 6) every ACK echoing `info`. Pace large keyframe bursts
+   (~0.8 ms between packets) — line-rate bursts into a stalled edge trip
+   the edge's flood protection.
+4. **BMOS**: table (class 0) first, then one class-1 message per frame with
+   PTS = `PTS_90kHz<<2` and the keyframe bit in `outer`; class-2 ADTS per
+   audio frame. Closed GOP, paramsets+IDR in one message (see rules above).
+5. **Chunking** (the failure modes are silent): head `0x80000000|last<<30|
+   len<<16|cnt<<8|cls`; continuations `[cls][cnt][u16 LE len]` with
+   `0x4000` set **only on a final partial chunk**; complete by accumulated
+   section length. No BMOS header on continuations.
+6. **Receiver side** (viewer): claim an *output* endpoint, same handshake
+   with the RTM role word `424d4f53 01000100 00080020 00080000` and latency
+   words `0086 0086`; join only after the routed source is ACTIVE; keep a
+   key ring (agreement KMRSP + mid-stream KM controls); ACK like stock SRT
+   (one full ACK per ~10 ms, real cumulative ack number in `info`).
 
 ### OBS specifically
 
@@ -340,21 +380,26 @@ Viewer-side requirements (all live-verified):
 | connect times out ~3 s, 0 bytes | streamid/passphrase wrong, no PBKEYLEN, claim expired, or seat taken |
 | handshake OK, router routes, but every output dark (YT dark, Remote Monitor crashes, input tiles dark while output tiles light) | the stream carries no keyframe slices — open-GOP H.265 encoder (CRA keyframes) through a filter that drops NAL 21; use closed GOP / a current bridge |
 | handshake OK, nothing routed at all | BMOS announce missing — encoder not using the bridge |
+| Remote Monitor connects, shows the input, but the picture stays black | multi-chunk messages never complete at the receiver: the final *partial* continuation chunk is missing its `0x4000` last-marker (§ BMOS container). Same black picture if BMOS headers are repeated on continuation chunks |
+| relay stops ACKing after a few seconds; sender stalls and must re-dial | continuation chunks malformed — most commonly the `0x4000` flag set on exact-fit full-size finals (only *partial* finals carry it), or repeated BMOS headers |
 | `relay ignored the conclusion` (bridge) | stale credential — re-run `--claim` |
 | bridge log `edge rejected the session` on re-dial | claim lapsed; with `--claim` the bridge re-claims automatically, otherwise restart it |
 | viewer receives ~2 GOP messages then silence | viewer ACK pattern (see § viewer requirements) |
-| viewer connects before source live, receives nothing | join after the source is ACTIVE |
+| viewer connects before source live, receives nothing | join after the source is ACTIVE; the session binds at connect time — reconnect after the source appears |
 | Claim 200-empty then Connect without fields | input occupied; another input |
 | works once, later fails | session values rotate per Connect; re-claim |
-| streaming output not pushing | check `router` output shows the route and gateway `live: true`; verify stream key/destination |
+| streaming output not pushing | check `router` output shows the route and gateway `live: true`; verify stream key/destination; confirm the key still belongs to a live stream on the provider (YouTube accepts-and-discards pushes for deleted/unbound streams) |
 
 ## 9. Scope
 
-Verified end-to-end: login, claim, connect, SRT handshake + BMOS activation
-(160-byte agreement), BMOS remux of live x265 encodes with **all keyframe
-messages forwarded by the router (50/50 over a 100 s run)**, and full
-receive-side decode (2 374 HEVC frames from the wire dump), plus
-router/routes/destination API and bridge auto-reconnect across encoder
-stop/start cycles. Session uuids are ~2-minute-lived values; examples here
-are dead sessions. `client_id`/`client_secret`/`x-api-key` are Blackmagic
-app constants shipped inside Resolve, not account secrets.
+Verified end-to-end (Nov 2026): login, claim, connect, SRT handshake + BMOS
+activation (160-byte agreement), BMOS remux of live x264/x265 encodes with
+all keyframe messages forwarded by the router, receiver-accurate
+reassembly (including the continuation last-marker), full receive-side
+decode (H.264/H.265 + AAC), 300 s uninterrupted bridge runs (76 k packets,
+zero stalls), router/routes/destination API, bridge auto-reconnect across
+encoder stop/start cycles, and playback of any output through the Python
+viewer and through Blackmagic's own Remote Monitor app. Session uuids are
+~2-minute-lived values; examples here are dead sessions.
+`client_id`/`client_secret`/`x-api-key` are Blackmagic app constants
+shipped inside Resolve, not account secrets.

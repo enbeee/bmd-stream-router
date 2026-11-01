@@ -8,3 +8,4 @@ __pycache__/
 *.pcap
 *.pcapng
 *keys*.json
+__pycache__/

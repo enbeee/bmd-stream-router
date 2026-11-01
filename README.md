@@ -14,6 +14,10 @@ an output, and drive it from Bitfocus Companion.
 - **`bmd_view.py`** — viewer: claims a viewing output like the Remote
   Monitor and re-muxes the stream back to MPEG-TS (play / record / push).
 - **`companion-module-bmd-stream-router/`** — Bitfocus Companion module.
+- **`tools/`** — capture-forensics helpers for debugging your own
+  implementation: `analyze_wire.py` (multi-key offline decryptor +
+  receiver-accurate BMOS reassembly) and `ack_profile.py` (SRT ACK/flow
+  control profile of a pcap capture).
 
 Quick start (details in `BMD_STREAM_ROUTER.md` §7):
 
