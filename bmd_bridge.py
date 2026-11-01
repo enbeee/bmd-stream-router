@@ -96,7 +96,8 @@ BTST_H265 = bytes.fromhex(
     '363500000000000000000000000061616320')
 BTST_H264 = BTST_H265.replace(b'H265', b'H264')
 BTST_H264 += bytes(52 - len(BTST_H264))   # captured packet is 52B incl. padding
-HSREQ = bytes.fromhex('00010500000000bf00880088')   # today's Resolve latency profile
+HSREQ = bytes.fromhex('00010500000000bf008b008b')   # byte-exact from Resolve's
+# captured conclusion (10.pcap); was 0088 0088 - keep it byte-exact
 
 # ------------------------------------------------------------- relay caller -
 class RelayCaller(threading.Thread):
@@ -758,14 +759,17 @@ class TsToBmos:
         return self._chunk(0, body, counter)
 
     def _chunk(self, cls, body, counter):
-        """BMD chunking (byte-verified from a real Resolve capture):
+        """BMD chunking (byte-verified from Resolve captures + davstream.dll):
         - single-chunk message: one BMOS-headered chunk, last=1
         - multi-chunk: ONLY the first chunk carries the BMOS header
-          (last=0); continuation chunks use their own 4-byte header
-          [0x01][msg counter][u16 BE payload length][section bytes].
-          Repeating the BMOS header on continuations gets forwarded by the
-          relay but CRASHES the Remote Monitor and darkens the egress -
-          BMD's parser reads every headered chunk as a new message head."""
+          (last=0); continuation chunks use a 4-byte header
+          [0x01][msg counter][u16 LE len | 0x4000 on the FINAL chunk]
+          — the 0x4000 flag is the last-marker the receiver's dispatcher
+          requires (type-1 path completes the unit); without it the unit
+          never completes and BMOS consumers render nothing (Remote
+          Monitor: connects, black picture).  Mid chunks: len < 0x4000.
+          Repeating the BMOS header on continuations crashes the Remote
+          Monitor — BMD's parser reads every headered chunk as a new head."""
         pkts = []
         first = True
         while True:
@@ -778,8 +782,15 @@ class TsToBmos:
                 pkts.append(struct.pack('<I', hdr) + part)
                 first = False
             else:
+                ln = len(part)
+                # 0x4000 last-marker only on a PARTIAL final chunk (matches
+                # Resolve byte-for-byte: exact-fit finals carry no flag —
+                # the receiver completes those by accumulated length)
+                if (not body and len(part) < self.CHUNK
+                        and os.environ.get('BRIDGE_LASTFLAG', '1') != '0'):
+                    ln |= 0x4000
                 pkts.append(bytes((0x01, counter & 0xFF))
-                            + struct.pack('<H', len(part)) + part)
+                            + struct.pack('<H', ln) + part)
             if not body:
                 return pkts
 

@@ -245,7 +245,7 @@ class Viewer(threading.Thread):
                 w0 = int.from_bytes(cand[0:4], 'little')
                 if ((w0 >> 31) & 1 and ((w0 >> 16) & 0x3FFF) == len(cand) - 4) \
                         or (cand[0] == 0x01
-                            and struct.unpack('<H', cand[2:4])[0] <= 1312):
+                            and (struct.unpack('<H', cand[2:4])[0] & 0x3FFF) <= 1312):
                     pt = cand
                     break
         if pt is None and self.keys:
@@ -644,7 +644,7 @@ def main():
             elif len(m) >= 4 and m[0] == 0x01:
                 # BMD continuation chunk: [0x01][cnt][u16 LE len][section]
                 if pend1 is not None:
-                    lnb = struct.unpack('<H', m[2:4])[0]
+                    lnb = struct.unpack('<H', m[2:4])[0] & 0x3FFF   # bit14 = last-flag
                     pend1[2] += m[4:4 + lnb]
                     if len(pend1[2]) >= pend1[0]:
                         vid_ev = (_nals_of(pend1[2][:pend1[0]]),
