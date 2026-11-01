@@ -229,13 +229,18 @@ messages are one packet: 4-byte LE header `[1|last|len:14|counter:8|class:8]`
 (bit 31 set, bit 30 = last, `len` = body length, `counter` = per-class rolling
 message counter, `class` = 0/1/2) followed by the body. **Messages larger
   than 0x520 (1312) bytes are chunked BMD-style (byte-verified from Resolve
-  captures): only the FIRST chunk carries the BMOS header (with last=0);
-  chunks 2..N carry a 4-byte continuation header instead —
-  `[0x01][msg_counter][u16 LE payload_len][section bytes]` — and the message
-completes when the accumulated section reaches the head chunk's outer
-length. Repeating the BMOS header on continuation chunks is forwarded by the
-relay but CRASHES the Remote Monitor and leaves the egress dark: BMD's
-parser treats every headered chunk as a new message head.**
+  captures and the davstream.dll receiver): only the FIRST chunk carries the
+  BMOS header (with last=0); chunks 2..N carry a 4-byte continuation header
+  instead — `[0x01][msg_counter][u16 LE len | 0x4000 on the FINAL PARTIAL
+chunk][section bytes]` — and the message completes when the accumulated
+section reaches the head chunk's outer length. The 0x4000 bit is the
+last-marker the receiver's dispatcher requires: omitting it on a partial
+final chunk leaves every multi-chunk message unassembled — the Remote
+Monitor then connects and stays black (its receiver silently drops units
+that never complete), and flagging exact-fit full-size finals instead makes
+the RELAY itself stop ACKing within seconds. Repeating the BMOS header on
+continuation chunks is forwarded by the relay but CRASHES the Remote
+Monitor: BMD's parser treats every headered chunk as a new message head.**
 
 - class 0 — `"BTST"` stream table: `"BTST" + 00000100` + 16-byte entries
   (video `[u32 0x30][u32 1][fourCC "H264"/"H265"][u32 0]`, audio
