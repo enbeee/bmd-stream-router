@@ -532,8 +532,8 @@ def resolve_router(tok=None, rid=None):
         rt = rr[0]
         set_router(rt['id'], tok)
         print(f"auto-selected router {rt.get('name')} ({rt['id']}) "
-              f"region {REGION}")
-        return ROUTER_ID
+              f"region {REGION}", file=sys.stderr)   # never stdout - callers
+        return ROUTER_ID                                            # capture it
     for rt in rr:
         print(f"  {rt['id']}  {rt.get('name','?'):18} {rt.get('region','')}")
     sys.exit('select one with --router <id> (or BRIDGE_ROUTER=...)')

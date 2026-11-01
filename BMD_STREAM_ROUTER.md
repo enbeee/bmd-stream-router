@@ -281,9 +281,11 @@ or fully driven:
 python3 bmd_claim.py stream --obs      # injects the key into OBS and starts
 ```
 
-Note `stream --obs` (no bridge) completes the handshake but the router will
-not route it — OBS's libsrt cannot send the BMOS announce; the bridge is
-required for generic encoders.
+Note `stream --obs` (no bridge) completes the handshake and the relay even
+forwards the raw MPEG-TS to routed outputs — but it is plain TS, not BMOS:
+BMD's consumers (Remote Monitor, Streaming Output egress, the Python
+viewer) find no decodable messages in it. The bridge is required for
+generic encoders.
 
 ### Native clients
 
@@ -294,12 +296,19 @@ use device markers in the same credential fields.
 ### Software viewer (receiving an output)
 
 `bmd_view.py` claims a viewing output like the Remote Monitor does and
-re-muxes the BMOS stream back to MPEG-TS / annex-B (`--out`, `--push URL`,
-`--play`), with `--raw`/`--wire` dumps for offline analysis:
+re-muxes the BMOS stream back to standards-shaped MPEG-TS with both tracks
+(video H.264/H.265 + AAC audio, PMT/PES/PTS/PCR): `--out FILE.ts` for a
+VLC-playable recording, `--push rtmp://…` to relay it on (bit-exact copy),
+`--play` for live ffplay, plus `--raw`/`--wire` dumps for offline analysis:
 
 ```
 python3 bmd_view.py <output-endpoint> --play     # after the source is live
 ```
+
+The same output feeds **Blackmagic's Remote Monitor app** with no extra
+setup: sign into the app with the BMD Cloud account, select the router,
+and open the output the input is routed to (join after the source is
+ACTIVE, same as the viewer).
 
 Viewer-side requirements (all live-verified):
 

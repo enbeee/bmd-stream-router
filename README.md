@@ -24,5 +24,17 @@ python3 bmd_bridge.py --claim                          # claims a free input
 # then point the encoder at  srt://127.0.0.1:9100?streamid=obs
 ```
 
+Receiving the stream (after routing the input to an output):
+
+```sh
+python3 bmd_view.py <output-endpoint> --play           # live preview
+python3 bmd_view.py <output-endpoint> --out stream.ts  # VLC-playable file
+python3 bmd_view.py <output-endpoint> --push rtmp://…  # relay it on
+```
+
+Blackmagic's own Remote Monitor app works on the same output: sign in with
+the BMD Cloud account, pick the router, open the routed output.
+
+
 `credentials.md` (and the runtime `session_claim.json`) are git-ignored —
 never commit them.
