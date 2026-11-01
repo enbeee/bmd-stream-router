@@ -211,11 +211,16 @@ Ctrl+C stops and releases the input.
 Then ensure routing (one-time; also settable in the Cloud web UI):
 
 ```
+python3 bmd_claim.py routers                                  # list routers
 python3 bmd_claim.py router                                   # inspect state
 python3 bmd_claim.py route <input-endpoint> <output-endpoint>
 python3 bmd_claim.py setdest <streaming-output> --url rtmp://… [--key K] [--pass P]
                                        # or --provider <id> --url-id <id> --key K
 ```
+
+With exactly one router on the account it is auto-selected (bridge, viewer
+and these commands all do this); otherwise pass `--router <id>` or set
+`BRIDGE_ROUTER=<id>`.
 
 #### BMOS container (data channel)
 

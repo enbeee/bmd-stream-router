@@ -920,6 +920,8 @@ def main():
         tok = B.token()
         if os.environ.get('BRIDGE_ROUTER'):
             B.set_router(os.environ['BRIDGE_ROUTER'], tok)  # alt router+region
+        else:
+            B.resolve_router(tok)   # auto-select when the account has one
         g = B.Grpc(tok)
         import re as _re
         msg = b'\x0a\x01\x01' + B.pb_str(2, B.DEVICE_ID) + B.pb_varint(4, 100)

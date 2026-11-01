@@ -432,7 +432,7 @@ def router_state(tok, router_id=None):
     sys.exit('no router state received')
 
 def cmd_router(tok, args):
-    st = router_state(tok, args.router)
+    st = router_state(tok, resolve_router(tok, args.router))
     print(f"router: {st.get('name')} ({st.get('id')}) region {st.get('region')}")
     print('\nsources (inputs):')
     for e in st.get('sources', []):
@@ -454,6 +454,7 @@ def cmd_router(tok, args):
         print(f"  {rt.get('source','?')} -> {rt.get('destination','?')}")
 
 def cmd_setdest(tok, args):
+    args.router = resolve_router(tok, args.router)
     gw = {'streamKey': args.key or ''}
     if args.sinkpass:
         gw['passphrase'] = args.sinkpass
@@ -473,12 +474,14 @@ def cmd_setdest(tok, args):
     print('destination updated (router %s / %s)' % (args.router or ROUTER_ID, args.endpoint))
 
 def cmd_route(tok, args):
+    args.router = resolve_router(tok, args.router)
     body = {'routerId': args.router or ROUTER_ID,
             'upserts': [{'source': args.source, 'destination': args.destination}]}
     web_rpc(tok, 'UpdateRoutes', body)
     print('routed')
 
 def cmd_unroute(tok, args):
+    args.router = resolve_router(tok, args.router)
     body = {'routerId': args.router or ROUTER_ID,
             'deletions': [{'source': args.source, 'destination': args.destination}]}
     web_rpc(tok, 'UpdateRoutes', body)
@@ -506,6 +509,34 @@ def set_router(rid, tok=None):
                 REGION = rt['region']
     except Exception:
         pass
+
+
+def resolve_router(tok=None, rid=None):
+    """Return the router to use, auto-discovering it when none is set.
+
+    With the placeholder default (fresh clone), queries GetRouters: one
+    router on the account -> select it (and its region) automatically;
+    several -> list them and exit. An explicit rid always wins."""
+    global ROUTER_ID
+    rid = rid or ROUTER_ID
+    if rid != 'router_0_0000000000000000000000000':
+        return rid
+    rr = web_rpc(tok or token(), 'GetRouters', {}).get('routers', [])
+    if len(rr) == 1:
+        rt = rr[0]
+        set_router(rt['id'], tok)
+        print(f"auto-selected router {rt.get('name')} ({rt['id']}) "
+              f"region {REGION}")
+        return ROUTER_ID
+    for rt in rr:
+        print(f"  {rt['id']}  {rt.get('name','?'):18} {rt.get('region','')}")
+    sys.exit('select one with --router <id> (or BRIDGE_ROUTER=...)')
+
+
+def cmd_routers(tok, args):
+    rr = web_rpc(tok, 'GetRouters', {}).get('routers', [])
+    for rt in rr:
+        print(f"  {rt['id']}  {rt.get('name','?'):18} {rt.get('region','')}")
 
 
 def parse_router_flag(argv):
@@ -552,6 +583,8 @@ if __name__ == '__main__':
                    obs_password=obs_password, obs_host=obs_host, obs_port=obs_port)
     elif cmd == 'unclaim':
         unclaim(tok, sys.argv[2])
+    elif cmd == 'routers':
+        cmd_routers(tok, None)
     elif cmd in ('router', 'setdest', 'route', 'unroute'):
         import argparse
         ap = argparse.ArgumentParser()

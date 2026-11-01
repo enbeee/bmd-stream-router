@@ -32,6 +32,8 @@ sys.path.insert(0, HERE)
 import bmd_claim as B                      # claim plane + crypto helpers
 if os.environ.get('BRIDGE_ROUTER'):
     B.set_router(os.environ['BRIDGE_ROUTER'], B.token())  # alt router+region
+elif __name__ == '__main__':       # never at import (offline tools import us)
+    B.resolve_router(B.token())     # auto-select when the account has one
 from bmd_bridge import (ctrl, now_us, le_pack_sid, rfc3394_wrap,
                         make_km, HSREQ, TsToBmos)
 
