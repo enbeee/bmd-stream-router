@@ -305,74 +305,165 @@ class Viewer(threading.Thread):
                 continue
             self._handle_data(pkt)
 
-
 class BmosToTs:
-    """Re-muxes received BMOS messages into MPEG-TS (PES video+audio)."""
+    """Re-muxes received BMOS messages into a standards-shaped MPEG-TS:
+    PAT/PMT, PES packets carrying the stream's own PTS (BMOS body word 0 =
+    PTS_90kHz << 2), PCR on the video pid, per-pid continuity counters.
+    A real PMT is what makes the audio track visible to VLC/ffprobe - bare
+    elementary streams in TS packets only get sniffed by ffmpeg, if that."""
+
+    PID_V, PID_A, PID_PMT = 0x100, 0x101, 0x1000
+    STREAM_TYPES = {'h264': 0x1B, 'hevc': 0x24}   # audio: AAC ADTS 0x0F
+    PAT_S = 0.4                      # re-send PAT/PMT at this cadence (s)
 
     def __init__(self):
-        self.t = 0
-        self.buf_out = bytearray()
+        self.codec = None            # 'h264' | 'hevc', set from first NAL
+        self.cc = {}                 # pid -> continuity counter
+        self._last_pat = 0.0
+        self._pend_audio = []        # audio TS bytes held until codec known
+        self._t = 0                  # fallback PTS counter (90 kHz ticks)
 
-    def feed(self, msgs):
-        ts = bytearray()
-        for m in msgs:
-            w0 = int.from_bytes(m[0:4], 'little')
-            cls = w0 & 0xFF
-            body = m[4:4 + ((w0 >> 16) & 0x3FFF)]
-            if cls == 1:
-                ts += self._video(body)
-            elif cls == 2:
-                ts += self._audio(body)
-        return bytes(ts)
+    # ---- MPEG-2 CRC (poly 0x04C11DB7, init/final all-ones) ----------
+    @staticmethod
+    def _crc(buf):
+        crc = 0xFFFFFFFF
+        for b in buf:
+            crc ^= b << 24
+            for _ in range(8):
+                crc = ((crc << 1) ^ 0x04C11DB7 if crc & 0x80000000
+                       else crc << 1) & 0xFFFFFFFF
+        return crc
 
-    def _video(self, body):
-        if len(body) < 20:
-            return b''
-        outer = struct.unpack('<I', body[16:20])[0] & 0x7FFFFFFF
-        sec = body[20:20 + outer]
-        nals = []
-        off = 0
-        while off + 4 <= len(sec):
-            ln = int.from_bytes(sec[off:off + 4], 'big')
-            if ln == 0 or off + 4 + ln > len(sec):
-                break
-            nals.append(b'\x00\x00\x00\x01' + sec[off + 4:off + 4 + ln])
-            off += 4 + ln
-        self.t += 3600
-        return self._ts_packets(b''.join(nals), stream=0x100)
+    # ---- 188-byte packet with optional adaptation field -------------
+    def _pkt(self, pid, payload, pusi=False, af=None):
+        cc = self.cc.get(pid, 0)
+        self.cc[pid] = (cc + 1) & 0xF
+        afc = 0b01 if af is None else 0b11
+        hdr = bytes((0x47,
+                     (0x40 if pusi else 0) | ((pid >> 8) & 0x1F),
+                     pid & 0xFF,
+                     (afc << 4) | cc))
+        return hdr + (af or b'') + payload
 
-    def _audio(self, body):
-        if len(body) < 12:
-            return b''
-        ln = struct.unpack('<I', body[8:12])[0]
-        self.t += 1920
-        return self._ts_packets(body[12:12 + ln], stream=0x101)
+    @staticmethod
+    def _stuff_af(pad):
+        # adaptation field whose only content is `pad` stuffing bytes
+        return bytes((pad - 1,)) + b'\xff' * (pad - 1) if pad > 1 else b'\x00'
 
-    def _ts_packets(self, payload, stream):
-        # single-PES-per-message approximation: raw payload in TS packets,
-        # PUSI on the first.  (ffmpeg's mpegts demuxer + parser recovers
-        # streams even from minimal TS like this when fed continuously.)
+    def _section_pkt(self, pid, sec):
+        payload = b'\x00' + sec                 # pointer_field 0
+        pad = 184 - len(payload)
+        return self._pkt(pid, payload + b'', pusi=True,
+                         af=self._stuff_af(pad)) if pad > 0 else \
+            self._pkt(pid, payload, pusi=True)
+
+    def _pat_pmt(self):
+        # section heads: table_id | (len patched later) | tsid/program u16
+        # | version/CNI | section# | last#  (tsid/program_number are 16-bit!)
+        pat = struct.pack('>BHHBBB', 0x00, 0xB00D, 1, 0xC1, 0, 0) \
+            + struct.pack('>HH', 1, 0xE000 | self.PID_PMT)
+        pat += struct.pack('>I', self._crc(pat))
+        pmt = struct.pack('>BHHBBB', 0x02, 0xB000, 1, 0xC1, 0, 0) \
+            + struct.pack('>HH', 0xE000 | self.PID_V, 0xF000)
+        if self.codec:
+            pmt += struct.pack('>BHH', self.STREAM_TYPES[self.codec],
+                               0xE000 | self.PID_V, 0xF000)
+            pmt += struct.pack('>BHH', 0x0F, 0xE000 | self.PID_A, 0xF000)
+        slen = len(pmt) - 3 + 4
+        pmt = pmt[:1] + struct.pack('>H', 0xB000 | slen) + pmt[3:]
+        pmt += struct.pack('>I', self._crc(pmt))
+        return self._section_pkt(0x0000, pat) + self._section_pkt(self.PID_PMT, pmt)
+
+    # ---- PES with PTS ------------------------------------------------
+    @staticmethod
+    def _pts_bytes(pts):
+        pts &= (1 << 33) - 1
+        return bytes((0x20 | ((pts >> 29) & 0x0E) | 1,
+                      (pts >> 22) & 0xFF,
+                      ((pts >> 14) & 0xFE) | 1,
+                      (pts >> 7) & 0xFF,
+                      ((pts << 1) & 0xFE) | 1))
+
+    @staticmethod
+    def _pcr_bytes(pcr):                     # pcr in 27 MHz units
+        base, ext = pcr // 300, pcr % 300
+        return bytes(((base >> 25) & 0xFF, (base >> 17) & 0xFF,
+                      (base >> 9) & 0xFF, (base >> 1) & 0xFF,
+                      ((base & 1) << 7) | 0x7E | ((ext >> 8) & 1),
+                      ext & 0xFF))
+
+    @staticmethod
+    def _pes(sid, pts, payload, bounded):
+        rest = b'\x80\x80\x05' + BmosToTs._pts_bytes(pts)
+        ln = (len(rest) + len(payload)) if bounded else 0
+        return (bytes((0, 0, 1, sid)) + struct.pack('>H', ln)
+                + rest + payload)
+
+    def _emit_pes(self, pid, pes, pcr=None, rai=False):
         out = bytearray()
+        total = len(pes)
+        pos = 0
         first = True
-        if not payload:
-            return b''
-        for off in range(0, len(payload), 184):
-            chunk = payload[off:off + 184]
-            afc = 0b01
-            af = b''
-            if len(chunk) < 184:
-                pad = 184 - len(chunk)
-                af = bytes([pad - 1]) + b'\xff' * (pad - 1) if pad > 1 else b''
-                if af:
-                    afc = 0b11
-                chunk = chunk + b'\xff' * pad if not af else chunk
-            hdr = bytes([0x47,
-                         (0x40 if first else 0) | (stream >> 8),
-                         stream & 0xFF,
-                         (afc << 4) | 0x00])
-            out += hdr + af + chunk
+        while True:
+            af = None
+            if first and (pcr is not None or rai):
+                body = bytearray()
+                body.append((0x40 if rai else 0) | (0x10 if pcr is not None else 0))
+                if pcr is not None:
+                    body += self._pcr_bytes(pcr)
+                af = bytearray((0,)) + body        # [len][flags][...] patched
+            room = 184 - (len(af) if af is not None else 0)
+            chunk = pes[pos:pos + room]
+            pos += len(chunk)
+            last = pos >= total
+            pad = room - len(chunk)
+            if last and pad > 0:
+                if af is not None:             # extend the existing AF body
+                    af += b'\xff' * pad
+                else:                          # AF consisting of stuffing only
+                    af = bytearray(self._stuff_af(pad))
+            if af is not None:
+                af[0] = len(af) - 1
+                af = bytes(af)
+            out += self._pkt(pid, chunk, pusi=first, af=af)
             first = False
+            if last:
+                break
         return bytes(out)
+
+    # ---- public API ---------------------------------------------------
+    def set_codec(self, name):
+        """Called once, from the first video NAL. Returns PAT/PMT + any
+        audio that arrived before the codec (and thus the PMT) was known."""
+        self.codec = name
+        flush = b''.join(self._pend_audio)
+        self._pend_audio = []
+        return self._pat_pmt() + flush
+
+    def add_video(self, nals, pts, keyframe):
+        annexb = b''.join(b'\x00\x00\x00\x01' + n for n in nals)
+        if pts is None:
+            self._t += 3600
+            pts = self._t
+        pre = b''
+        if keyframe or time.time() - self._last_pat >= self.PAT_S:
+            self._last_pat = time.time()
+            pre = self._pat_pmt()
+        pes = self._pes(0xE0, pts, annexb, bounded=False)
+        return pre + self._emit_pes(self.PID_V, pes, pcr=pts * 300, rai=keyframe)
+
+    def add_audio(self, adts, pts):
+        if pts is None:
+            self._t += 1920
+            pts = self._t
+        pes = self._pes(0xC0, pts, adts, bounded=True)
+        pkts = self._emit_pes(self.PID_A, pes)
+        if not self.codec:            # PMT needs the video stream type
+            self._pend_audio.append(pkts)
+            return b''
+        return pkts
+
+
 
 
 def main():
@@ -454,12 +545,25 @@ def main():
     ff = None
     fmt = [None]     # 'h264' | 'hevc', detected from first NAL
 
+    mux = BmosToTs()
+
+    def emit(b):
+        if not b:
+            return
+        if out_f:
+            out_f.write(b)
+        if ff:
+            try:
+                ff.stdin.write(b)
+            except (BrokenPipeError, ValueError):
+                pass
+
     def detect_and_start(nal):
         if fmt[0]:
             return
         h264 = (nal[0] & 0x1F) in (7, 8, 5, 1)
         fmt[0] = 'h264' if h264 else 'hevc'
-        log(f'video format detected: {fmt[0]} (piping MPEG-TS with audio)')
+        log(f'video format detected: {fmt[0]} (writing MPEG-TS with audio)')
         nonlocal ff
         if args.push:
             ff = subprocess.Popen(
@@ -470,43 +574,24 @@ def main():
             ff = subprocess.Popen(
                 ['ffplay', '-hide_banner', '-loglevel', 'error',
                  '-f', 'mpegts', '-'])
+        emit(mux.set_codec(fmt[0]))   # PAT/PMT + audio held so far
 
     total = vid = aud = 0
-    t0 = time.time()
 
-    def video_nals(m):
-        w0 = int.from_bytes(m[0:4], 'little')
-        if (w0 & 0xFF) != 1 or not (w0 >> 30) & 1:
-            return None
-        body = m[4:4 + ((w0 >> 16) & 0x3FFF)]
-        if len(body) < 20:
-            return None
-        outer = struct.unpack('<I', body[16:20])[0] & 0x7FFFFFFF
-        sec = body[20:20 + outer]
+    def _nals_of(sec):
         nals = []
         off = 0
         while off + 4 <= len(sec):
             ln = int.from_bytes(sec[off:off + 4], 'big')
             if ln == 0 or off + 4 + ln > len(sec):
                 break
-            nals.append((sec[off + 4:off + 4 + ln]))
-            off += 4 + ln
-        return nals
-
-    def _nals_of(sec):
-        nals = []
-        off = 0
-        while off + 4 <= len(sec):
-            ln = int.from_bytes(sec[off:off+4], 'big')
-            if ln == 0 or off + 4 + ln > len(sec):
-                break
-            nals.append(sec[off+4:off+4+ln])
+            nals.append(sec[off + 4:off + 4 + ln])
             off += 4 + ln
         return nals or None
 
     t0 = time.time()
     rejoins = int(os.environ.get('VIEW_REJOINS', '0'))
-    pend1 = None      # [outer_len, keyframe, section] for multi-chunk video
+    pend1 = None      # [outer_len, keyframe, section, pts] multi-chunk video
     try:
         while viewer.is_alive() and not viewer.dead.is_set():
             if total == 0 and time.time() - t0 > 8:
@@ -534,44 +619,49 @@ def main():
             total += 1
             if raw_f:
                 raw_f.write(m)
-            nals = None
+            vid_ev = aud_ev = None
             w0 = int.from_bytes(m[0:4], 'little') if len(m) >= 4 else 0
             if (w0 >> 31) & 1:
                 # BMOS chunk (bit31 checked FIRST - class-1 heads also begin
                 # with byte 0x01 and must not be taken for continuations)
-                if (w0 & 0xFF) == 1 and (w0 >> 30) & 1:
-                    nals = video_nals(m)
-                elif (w0 & 0xFF) == 1 and len(m) >= 24:
-                    # multi-chunk head: [BMOS hdr][ts][12z][outer][section..]
-                    body = m[4:]
+                body = m[4:4 + ((w0 >> 16) & 0x3FFF)]
+                pts = (int.from_bytes(body[0:4], 'little') >> 2) \
+                    if len(body) >= 4 else None
+                cls = w0 & 0xFF
+                if cls == 1 and (w0 >> 30) & 1 and len(body) >= 20:
+                    outer = struct.unpack('<I', body[16:20])[0]
+                    vid_ev = (_nals_of(body[20:20 + (outer & 0x7FFFFFFF)]),
+                              pts, bool(outer & 0x80000000))
+                elif cls == 1 and len(body) >= 20:
+                    # multi-chunk head: [hdr][ts][12z][outer][section..]
                     outer = struct.unpack('<I', body[16:20])[0]
                     pend1 = [outer & 0x7FFFFFFF, bool(outer & 0x80000000),
-                             body[20:]]
+                             body[20:], pts]
+                elif cls == 2 and (w0 >> 30) & 1 and len(body) >= 12:
+                    # audio: [ts][u32 0][u32 len][ADTS frame]
+                    ln = struct.unpack('<I', body[8:12])[0]
+                    aud_ev = (body[12:12 + ln], pts)
             elif len(m) >= 4 and m[0] == 0x01:
                 # BMD continuation chunk: [0x01][cnt][u16 LE len][section]
                 if pend1 is not None:
                     lnb = struct.unpack('<H', m[2:4])[0]
-                    pend1[2] += m[4:4+lnb]
+                    pend1[2] += m[4:4 + lnb]
                     if len(pend1[2]) >= pend1[0]:
-                        sec = pend1[2][:pend1[0]]
-                        nals = _nals_of(sec)
+                        vid_ev = (_nals_of(pend1[2][:pend1[0]]),
+                                  pend1[3], pend1[1])
                         pend1 = None
-            if nals:
+            if vid_ev and vid_ev[0]:
+                nals, pts, kf = vid_ev
                 vid += 1
-                annexb = b''.join(b'\x00\x00\x00\x01' + n for n in nals)
-                if ff is None and not (args.out and not args.push and not args.play) or ff is None:
+                if fmt[0] is None:
                     detect_and_start(nals[0])
-                if ff:
-                    ff.stdin.write(annexb)
-                if out_f:
-                    out_f.write(annexb)
-            elif m and m[0] & 0x80 == 0 and (int.from_bytes(m[0:4], 'little') >> 31) & 1:
-                w0 = int.from_bytes(m[0:4], 'little')
-                if (w0 & 0xFF) != 1:
-                    aud += 1
+                emit(mux.add_video(nals, pts, kf))
+            if aud_ev and aud_ev[0]:
+                aud += 1
+                emit(mux.add_audio(aud_ev[0], aud_ev[1]))
             if total % 200 == 0:
                 log(f'received {total} msgs ({total/(time.time()-t0):.0f}/s), '
-                    f'video {vid}, other {aud}')
+                    f'video {vid}, audio {aud}')
     except KeyboardInterrupt:
         pass
     log(f'total {total} msgs (video {vid}); releasing output')
