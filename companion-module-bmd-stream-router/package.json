@@ -1,0 +1,13 @@
+{
+  "name": "bitfocus-companion-module-bmd-stream-router",
+  "version": "0.1.0",
+  "main": "src/main.js",
+  "license": "MIT",
+  "description": "Control the Blackmagic Cloud Stream Router: switch inputs/outputs, manage streaming output services",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@companion-module/base": "~2.1.3"
+  }
+}

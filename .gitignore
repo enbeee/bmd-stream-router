@@ -1,0 +1,10 @@
+# account credentials + runtime state - never commit
+credentials.md
+session_claim.json
+*.log
+__pycache__/
+*.pyc
+# captures and key dumps from debugging
+*.pcap
+*.pcapng
+*keys*.json

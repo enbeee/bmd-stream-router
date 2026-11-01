@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""Software viewer for a Blackmagic Cloud Stream Router output.
+
+Claims a router OUTPUT endpoint (like a Streaming Decoder / Remote Monitor
+does), connects, receives the BMOS stream, decrypts it, re-muxes to MPEG-TS
+and pipes it to ffmpeg (file, RTMP push, or local playback).
+
+Usage:
+  python3 bmd_view.py <output_endpoint_id> [--out FILE.ts|--push URL|--play]
+
+  --out FILE   write demuxed MPEG-TS to FILE (then Ctrl+C)
+  --push URL   pipe to: ffmpeg -f mpegts -i - -c copy <URL>
+  --play       pipe to ffplay
+
+Requires: pip install httpx[http2] cryptography ; ffmpeg in PATH for push/play.
+The routed INPUT must be streaming before you start (Connect waits for it).
+"""
+import argparse
+import hashlib
+import os
+import queue
+import random
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import bmd_claim as B                      # claim plane + crypto helpers
+if os.environ.get('BRIDGE_ROUTER'):
+    B.set_router(os.environ['BRIDGE_ROUTER'], B.token())  # alt router+region
+from bmd_bridge import (ctrl, now_us, le_pack_sid, rfc3394_wrap,
+                        make_km, HSREQ, TsToBmos)
+
+
+def unwrap(kek, w):
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    C = [int.from_bytes(w[i:i + 8], 'big') for i in range(0, len(w), 8)]
+    n = len(C) - 1
+    A = C[0]
+    R = C[1:]
+    dec = Cipher(algorithms.AES(kek), modes.ECB()).decryptor()
+    for j in range(5, -1, -1):
+        for i in range(n, 0, -1):
+            blk = dec.update((A ^ (n * j + i)).to_bytes(8, 'big')
+                             + R[i - 1].to_bytes(8, 'big'))
+            A = int.from_bytes(blk[:8], 'big')
+            R[i - 1] = int.from_bytes(blk[8:], 'big')
+    return (b''.join(x.to_bytes(8, 'big') for x in R)
+            if A == 0xA6A6A6A6A6A6A6A6 else None)
+
+
+class Viewer(threading.Thread):
+    """SRT caller that receives the router's BMOS stream."""
+
+    def __init__(self, host, port, sid, passphrase, log, wire_f=None):
+        super().__init__(daemon=True)
+        self.addr = (host, int(port))
+        self.sid, self.passwd = sid, passphrase
+        self.log = log
+        self.wire_f = wire_f   # optional dump of ENCRYPTED wire packets
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(5)
+        self.ok = threading.Event()
+        self.dead = threading.Event()
+        self.t0 = time.time()
+        self.isn = random.getrandbits(31)
+        self.relay_sock = None
+        self.salt = None
+        self.sek = None            # relay->us SEK from KMRSP
+        self.keys = []             # keyring: [(sek, salt)] newest first
+        self.in_q = queue.Queue()  # decrypted BMOS packets
+        self.last_ack = 0
+        self.last_full_t = 0.0
+
+    def send(self, pkt):
+        self.sock.sendto(pkt, self.addr)
+
+    def run(self):
+        try:
+            self._handshake()
+        except Exception as ex:
+            self.log(f'handshake failed: {ex}')
+            return
+        self.ok.set()
+        self._receive()
+
+    def _handshake(self):
+        mysock = random.getrandbits(31)
+        indu = (ctrl(0, 0, 0, now_us(self.t0), 0)
+                + struct.pack('>IIIII', 4, 2, self.isn, 1500, 8192)
+                + struct.pack('>II', 1, mysock) + bytes(4)
+                + bytes.fromhex('0025142d') + bytes(12))
+        self.send(indu)
+        resp, _ = self.sock.recvfrom(2048)
+        cookie = resp[16 + 28:16 + 32]
+        sek, salt, km = make_km(self.passwd)     # our tx key (upstream is idle)
+        self.v_sek, self.v_salt = sek, salt      # what we offered upstream
+        sidw = le_pack_sid(self.sid)
+        # viewer-role announce, byte-exact from a real Remote Monitor capture:
+        # role word3 = 0008 0020 (the 0x20 receive flag is the LOW byte -
+        # 0x2000 in the wrong byte position made the relay treat us as an
+        # encoder-role peer)
+        blob = (bytes.fromhex('424d4f53010001000008002000080000')
+                + struct.pack('<HH', 2, 1) + struct.pack('>H', random.getrandbits(16)) + b'\x00\x00')
+        # HSREQ latency words 0086 - the Remote Monitor's viewer value (the
+        # encoder profile uses 0088)
+        HSREQ_V = bytes.fromhex('00010500000000bf00860086')
+        exts = (struct.pack('>HH', 1, 3) + HSREQ_V
+                + struct.pack('>HH', 5, len(sidw) // 4) + sidw
+                + struct.pack('>HH', 3, len(km) // 4) + km
+                + struct.pack('>HH', 0xBD01, 6) + blob)
+        concl = (ctrl(0, 0, 0, now_us(self.t0), 0)
+                 + struct.pack('>IIIII', 5, 7, self.isn, 1500, 8192)
+                 + struct.pack('>II', 0xFFFFFFFF, mysock) + cookie
+                 + bytes(16) + exts)
+        self.send(concl)
+        self.send(concl)      # RTM sends the conclusion twice
+        # the relay may push cached stream data IMMEDIATELY - data packets can
+        # land before/around the agreement. Only a CONTROL handshake packet
+        # (cmd 0, >100B) is the agreement; buffer early data for later.
+        ag = None
+        early = []
+        for _ in range(24):
+            pkt, _ = self.sock.recvfrom(65536)
+            if (len(pkt) >= 16 and (pkt[0] & 0x80)
+                    and (struct.unpack('>H', pkt[:2])[0] & 0x7FFF) == 0
+                    and len(pkt) > 100):
+                ag = pkt
+                break
+            if pkt[:1] == b'\x80' and b'\x12\x20\x29' in pkt:
+                # a KM control can beat the agreement - ingest it now
+                cd = os.environ.get('VIEW_CTRL_DUMP')
+                if cd:
+                    with open(cd, 'ab') as fh:
+                        fh.write(struct.pack('<I', len(pkt)) + pkt)
+                self._km_update(pkt)
+            early.append(pkt)
+        self._early = early
+        if not ag:
+            raise RuntimeError('no agreement from relay')
+        self.relay_sock = struct.unpack('>I', ag[16 + 24:16 + 28])[0]
+        # KMRSP (type 4) in the agreement carries the relay's downstream key
+        body = ag[16:]
+        i = 48
+        exts_seen = []
+        while i + 4 <= len(body):
+            t, l = struct.unpack_from('>HH', body, i)
+            c = body[i + 4:i + 4 + l * 4]
+            exts_seen.append(f'{t:#x}/{l}w')
+            if t == 4:
+                rsalt, rwrap = c[16:32], c[32:56]
+                kek = hashlib.pbkdf2_hmac('sha1', self.passwd.encode(),
+                                          rsalt[-8:], 2048, 16)
+                self.salt = rsalt
+                self.sek = unwrap(kek, rwrap)
+                if self.sek:
+                    self.keys.insert(0, (self.sek, self.salt))
+            elif t in (3, 4, 5) or b'\x12\x20\x29' in c:
+                # KM block in some other ext type: unwrap too
+                if len(c) >= 56 and c[:4] == b'\x12\x20\x29':
+                    rsalt, rwrap = c[16:32], c[32:56]
+                    kek = hashlib.pbkdf2_hmac('sha1', self.passwd.encode(),
+                                              rsalt[-8:], 2048, 16)
+                    k2 = unwrap(kek, rwrap)
+                    if k2:
+                        self.keys.append((k2, rsalt))
+                        if not self.sek:
+                            self.sek, self.salt = k2, rsalt
+            i += 4 + l * 4
+        self.log(f'agreement {len(ag)}B relay_sock={self.relay_sock:#x} '
+                 f'exts=[{" ".join(exts_seen)}] '
+                 f'downstream-key={"ok" if self.sek else "MISSING"}')
+        if not self.sek:
+            self.log('no key in agreement (relay may push one mid-stream); '
+                     f'agreement hex: {ag.hex()[:200]}')
+        dk = os.environ.get('VIEW_DUMP_KEYS')
+        if dk and self.sek:
+            __import__('json').dump({'r_sek': self.sek.hex(),
+                                     'r_salt': self.salt.hex(),
+                                     'v_sek': self.v_sek.hex(),
+                                     'v_salt': self.v_salt.hex(),
+                                     'pass': self.passwd,
+                                     'agreement_hex': ag.hex()},
+                                    open(dk, 'w'))
+
+    def _km_update(self, pkt):
+        """Any packet carrying a KMSG: unwrap SEK with OUR passphrase and
+        add it to the keyring (the relay re-wraps the source's SEK for us)."""
+        o = pkt.find(b'\x12\x20\x29')
+        if o < 0 or len(pkt) < o + 56:
+            return
+        rsalt, rwrap = pkt[o + 16:o + 32], pkt[o + 32:o + 56]
+        kek = hashlib.pbkdf2_hmac('sha1', self.passwd.encode(),
+                                  rsalt[-8:], 2048, 16)
+        sek = unwrap(kek, rwrap)
+        if sek:
+            if not any(k[0] == sek for k in self.keys):
+                self.keys.insert(0, (sek, rsalt))
+                own = sek == getattr(self, 'v_sek', b'')
+                self.log(f'key update: sek={"OUR-OWN-ECHO" if own else "NEW-KEY"}'
+                         f' (salt {rsalt[:4].hex()}.., {len(self.keys)} key(s) in ring)')
+                cd = os.environ.get('VIEW_CTRL_DUMP')
+                if cd:
+                    with open(cd, 'ab') as fh:
+                        fh.write(struct.pack('<I', len(pkt)) + pkt)
+                dk = os.environ.get('VIEW_DUMP_KEYS')
+                if dk:
+                    try:
+                        j = __import__('json').load(open(dk))
+                    except Exception:
+                        j = {}
+                    j['km_update_sek'] = sek.hex()
+                    j['km_update_salt'] = rsalt.hex()
+                    j['km_update_hex'] = pkt.hex()
+                    __import__('json').dump(j, open(dk, 'w'))
+        else:
+            self.log('key update: SEK unwrap FAILED (passphrase mismatch?)')
+
+    def _handle_data(self, pkt):
+        """Process one wire DATA packet: dump, decrypt via keyring, queue,
+        ACK. Returns False if the packet is not data."""
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        if len(pkt) < 16 or pkt[0] & 0x80:
+            return False
+        seq = struct.unpack('>I', pkt[:4])[0] & 0x7FFFFFFF
+        if self.wire_f:
+            self.wire_f.write(struct.pack('<I', len(pkt)) + pkt)
+        pt = None
+        for sek, salt in self.keys:
+            iv = bytearray(16)
+            iv[0:10] = salt[0:10]
+            iv[10:14] = bytes(a ^ b for a, b in zip(
+                salt[10:14], seq.to_bytes(4, 'big')))
+            cand = Cipher(algorithms.AES(sek), modes.CTR(bytes(iv))) \
+                .decryptor().update(pkt[16:])
+            # full structural check (bit31 alone passes on random data
+            # half the time and lets a WRONG key win):
+            if len(cand) >= 4:
+                w0 = int.from_bytes(cand[0:4], 'little')
+                if ((w0 >> 31) & 1 and ((w0 >> 16) & 0x3FFF) == len(cand) - 4) \
+                        or (cand[0] == 0x01
+                            and struct.unpack('<H', cand[2:4])[0] <= 1312):
+                    pt = cand
+                    break
+        if pt is None and self.keys:
+            sek, salt = self.keys[0]
+            iv = bytearray(16)
+            iv[0:10] = salt[0:10]
+            iv[10:14] = bytes(a ^ b for a, b in zip(
+                salt[10:14], seq.to_bytes(4, 'big')))
+            pt = Cipher(algorithms.AES(sek), modes.CTR(bytes(iv))) \
+                .decryptor().update(pkt[16:])
+        if pt is not None:
+            self.in_q.put(pt)
+        self.last_ack = seq
+        # stock-SRT receiver ACKing: one full ACK per ~10 ms carrying the
+        # cumulative ack number (flooding light ACKs or sending a wrong ack
+        # number makes the relay stop forwarding to this viewer).
+        now = time.time()
+        if now - self.last_full_t >= 0.010:
+            self.send(ctrl(2, 0, self.last_ack, now_us(self.t0),
+                           self.relay_sock,
+                           struct.pack('>IIIIIII', self.last_ack, 1000, 500,
+                                       8192, 125000, 1000, 0)))
+            self.last_full_t = now
+        return True
+
+    def _receive(self):
+        self.sock.settimeout(1.0)
+        self.last_ack = 0
+        self.last_full_t = 0.0
+        for pkt in getattr(self, '_early', []):   # cached packets that beat
+            if pkt[:1] == b'\x80':                # the agreement
+                if b'\x12\x20\x29' in pkt:
+                    self._km_update(pkt)
+            else:
+                self._handle_data(pkt)
+        self._early = []
+        while not self.dead.is_set():
+            try:
+                pkt, _ = self.sock.recvfrom(65536)
+            except socket.timeout:
+                self.send(ctrl(1, 0, 0, now_us(self.t0), self.relay_sock))
+                continue
+            except OSError:
+                break
+            if len(pkt) < 16:
+                continue
+            if pkt[0] & 0x80:                     # control
+                cmd = struct.unpack('>H', pkt[:2])[0] & 0x7FFF
+                if b'\x12\x20\x29' in pkt:
+                    self._km_update(pkt)
+                if cmd == 1:                       # keepalive
+                    self.send(ctrl(1, 0, 0, now_us(self.t0), self.relay_sock))
+                elif cmd not in (0, 2, 3, 5, 6, 7, 8):
+                    self.log(f'relay ctrl cmd={cmd:#x} sub='
+                             f'{struct.unpack(">H", pkt[2:4])[0]:#x} '
+                             f'len={len(pkt)} {pkt[:48].hex()}')
+                continue
+            self._handle_data(pkt)
+
+
+class BmosToTs:
+    """Re-muxes received BMOS messages into MPEG-TS (PES video+audio)."""
+
+    def __init__(self):
+        self.t = 0
+        self.buf_out = bytearray()
+
+    def feed(self, msgs):
+        ts = bytearray()
+        for m in msgs:
+            w0 = int.from_bytes(m[0:4], 'little')
+            cls = w0 & 0xFF
+            body = m[4:4 + ((w0 >> 16) & 0x3FFF)]
+            if cls == 1:
+                ts += self._video(body)
+            elif cls == 2:
+                ts += self._audio(body)
+        return bytes(ts)
+
+    def _video(self, body):
+        if len(body) < 20:
+            return b''
+        outer = struct.unpack('<I', body[16:20])[0] & 0x7FFFFFFF
+        sec = body[20:20 + outer]
+        nals = []
+        off = 0
+        while off + 4 <= len(sec):
+            ln = int.from_bytes(sec[off:off + 4], 'big')
+            if ln == 0 or off + 4 + ln > len(sec):
+                break
+            nals.append(b'\x00\x00\x00\x01' + sec[off + 4:off + 4 + ln])
+            off += 4 + ln
+        self.t += 3600
+        return self._ts_packets(b''.join(nals), stream=0x100)
+
+    def _audio(self, body):
+        if len(body) < 12:
+            return b''
+        ln = struct.unpack('<I', body[8:12])[0]
+        self.t += 1920
+        return self._ts_packets(body[12:12 + ln], stream=0x101)
+
+    def _ts_packets(self, payload, stream):
+        # single-PES-per-message approximation: raw payload in TS packets,
+        # PUSI on the first.  (ffmpeg's mpegts demuxer + parser recovers
+        # streams even from minimal TS like this when fed continuously.)
+        out = bytearray()
+        first = True
+        if not payload:
+            return b''
+        for off in range(0, len(payload), 184):
+            chunk = payload[off:off + 184]
+            afc = 0b01
+            af = b''
+            if len(chunk) < 184:
+                pad = 184 - len(chunk)
+                af = bytes([pad - 1]) + b'\xff' * (pad - 1) if pad > 1 else b''
+                if af:
+                    afc = 0b11
+                chunk = chunk + b'\xff' * pad if not af else chunk
+            hdr = bytes([0x47,
+                         (0x40 if first else 0) | (stream >> 8),
+                         stream & 0xFF,
+                         (afc << 4) | 0x00])
+            out += hdr + af + chunk
+            first = False
+        return bytes(out)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('endpoint', help='output endpoint id (see bmd_claim.py router)')
+    ap.add_argument('--out', help='write demuxed TS here')
+    ap.add_argument('--push', help='ffmpeg -c copy push target URL')
+    ap.add_argument('--play', action='store_true')
+    ap.add_argument('--raw', help='also dump raw decrypted BMOS here')
+    ap.add_argument('--wire', help='dump ENCRYPTED wire packets here (for '
+                                   'offline multi-key analysis)')
+    args = ap.parse_args()
+
+    def log(m):
+        print(time.strftime('%H:%M:%S'), m, flush=True)
+
+    tok = B.token()
+    g = B.Grpc(tok)
+    msg = (B.pb_str(1, B.ROUTER_ID) + B.pb_str(2, args.endpoint)
+           + B.pb_str(3, B.DEVICE_ID))
+    st, info, resp = g.call('Claim', msg, region=True)
+    if st != 200:
+        sys.exit(f'Claim failed: {st} {info[:120]}')
+    log('output claimed; waiting for a live source on its route...')
+    st = info = resp = None
+    while True:
+        # report the routed source's state so the user sees what's missing
+        try:
+            rs = B.router_state(tok)
+            srcs = {e['id']: e.get('status') for e in rs.get('sources', [])}
+            routed = [r['source'] for r in rs.get('routes', [])
+                      if r['destination'] == args.endpoint]
+            desc = ', '.join(f'{s}={srcs.get(s, "?")}' for s in routed) or 'NO ROUTE'
+            live = any(srcs.get(s) == 'STATUS_ACTIVE' for s in routed)
+            log(f'route source: {desc}')
+        except Exception as ex:
+            log(f'(state check failed: {ex})')
+            live = False
+        g.client.timeout = 12
+        try:
+            st, info, resp = g.call('Connect', msg, region=True)
+            if st == 200 and resp:
+                break
+            log(f'Connect: {st} {str(info)[:60]} - retrying in 5s')
+        except Exception as ex:
+            log(f'Connect waiting ({type(ex).__name__}) - retry in 5s; '
+                'start the bridge+OBS now' if not live else
+                f'Connect failed: {type(ex).__name__} - retry in 5s')
+        time.sleep(5)
+    f = B.pb_parse(resp)
+    v = lambda n: f[n][0].decode() if isinstance(f[n][0], bytes) else str(f[n][0])
+    if len(f) > 4:
+        log(f'ConnectResponse extra fields: '
+            f'{ {k: [str(x)[:60] for x in vs] for k, vs in f.items()} }')
+    hostport, pw = v(1), v(3)
+    sid = B.build_streamid(v(2), v(3), v(4))
+    log(f'viewer session: {hostport}')
+
+    host, port = hostport.split(':')
+    wire_f = open(args.wire, 'wb') if args.wire else None
+    viewer = Viewer(host, port, sid, pw, log, wire_f=wire_f)
+    # VIEW_EXTRA_KEYS=json-file with sek/salt hex: seed the keyring with keys
+    # from another party (e.g. the bridge's BRIDGE_DUMP_KEYS file) - the relay
+    # tunnels the SOURCE's SEK, so the agreement key alone may not decrypt.
+    xf = os.environ.get('VIEW_EXTRA_KEYS')
+    if xf and os.path.exists(xf):
+        j = __import__('json').load(open(xf))
+        for sk, sa in ((j.get('b_sek'), j.get('b_salt')),
+                       (j.get('sek'), j.get('salt'))):
+            if sk and sa:
+                viewer.keys.append((bytes.fromhex(sk), bytes.fromhex(sa)))
+                log(f'keyring: extra key loaded from {xf}')
+    viewer.start()
+    if not viewer.ok.wait(10):
+        sys.exit('viewer handshake failed')
+
+    raw_f = open(args.raw, 'wb') if args.raw else None
+    out_f = open(args.out, 'wb') if args.out else None
+    ff = None
+    fmt = [None]     # 'h264' | 'hevc', detected from first NAL
+
+    def detect_and_start(nal):
+        if fmt[0]:
+            return
+        h264 = (nal[0] & 0x1F) in (7, 8, 5, 1)
+        fmt[0] = 'h264' if h264 else 'hevc'
+        log(f'video format detected: {fmt[0]} (piping MPEG-TS with audio)')
+        nonlocal ff
+        if args.push:
+            ff = subprocess.Popen(
+                ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+                 '-f', 'mpegts', '-i', '-', '-c', 'copy', '-f', 'flv',
+                 args.push])
+        elif args.play:
+            ff = subprocess.Popen(
+                ['ffplay', '-hide_banner', '-loglevel', 'error',
+                 '-f', 'mpegts', '-'])
+
+    total = vid = aud = 0
+    t0 = time.time()
+
+    def video_nals(m):
+        w0 = int.from_bytes(m[0:4], 'little')
+        if (w0 & 0xFF) != 1 or not (w0 >> 30) & 1:
+            return None
+        body = m[4:4 + ((w0 >> 16) & 0x3FFF)]
+        if len(body) < 20:
+            return None
+        outer = struct.unpack('<I', body[16:20])[0] & 0x7FFFFFFF
+        sec = body[20:20 + outer]
+        nals = []
+        off = 0
+        while off + 4 <= len(sec):
+            ln = int.from_bytes(sec[off:off + 4], 'big')
+            if ln == 0 or off + 4 + ln > len(sec):
+                break
+            nals.append((sec[off + 4:off + 4 + ln]))
+            off += 4 + ln
+        return nals
+
+    def _nals_of(sec):
+        nals = []
+        off = 0
+        while off + 4 <= len(sec):
+            ln = int.from_bytes(sec[off:off+4], 'big')
+            if ln == 0 or off + 4 + ln > len(sec):
+                break
+            nals.append(sec[off+4:off+4+ln])
+            off += 4 + ln
+        return nals or None
+
+    t0 = time.time()
+    rejoins = int(os.environ.get('VIEW_REJOINS', '0'))
+    pend1 = None      # [outer_len, keyframe, section] for multi-chunk video
+    try:
+        while viewer.is_alive() and not viewer.dead.is_set():
+            if total == 0 and time.time() - t0 > 8:
+                # we joined before the routed source went live: the relay
+                # bound this session to nothing and it will never carry
+                # data. Release and restart (the join-loop then attaches to
+                # the now-live source).
+                if rejoins >= 5:
+                    log('still no data after re-joins - source really idle?')
+                    break
+                log('no data 8 s after join - re-joining behind the live source')
+                viewer.dead.set()
+                try:
+                    viewer.sock.close()
+                except Exception:
+                    pass
+                B.unclaim(tok, args.endpoint)
+                os.environ['VIEW_REJOINS'] = str(rejoins + 1)
+                os.execv(sys.executable,
+                         [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+            try:
+                m = viewer.in_q.get(timeout=2)
+            except queue.Empty:
+                continue
+            total += 1
+            if raw_f:
+                raw_f.write(m)
+            nals = None
+            w0 = int.from_bytes(m[0:4], 'little') if len(m) >= 4 else 0
+            if (w0 >> 31) & 1:
+                # BMOS chunk (bit31 checked FIRST - class-1 heads also begin
+                # with byte 0x01 and must not be taken for continuations)
+                if (w0 & 0xFF) == 1 and (w0 >> 30) & 1:
+                    nals = video_nals(m)
+                elif (w0 & 0xFF) == 1 and len(m) >= 24:
+                    # multi-chunk head: [BMOS hdr][ts][12z][outer][section..]
+                    body = m[4:]
+                    outer = struct.unpack('<I', body[16:20])[0]
+                    pend1 = [outer & 0x7FFFFFFF, bool(outer & 0x80000000),
+                             body[20:]]
+            elif len(m) >= 4 and m[0] == 0x01:
+                # BMD continuation chunk: [0x01][cnt][u16 LE len][section]
+                if pend1 is not None:
+                    lnb = struct.unpack('<H', m[2:4])[0]
+                    pend1[2] += m[4:4+lnb]
+                    if len(pend1[2]) >= pend1[0]:
+                        sec = pend1[2][:pend1[0]]
+                        nals = _nals_of(sec)
+                        pend1 = None
+            if nals:
+                vid += 1
+                annexb = b''.join(b'\x00\x00\x00\x01' + n for n in nals)
+                if ff is None and not (args.out and not args.push and not args.play) or ff is None:
+                    detect_and_start(nals[0])
+                if ff:
+                    ff.stdin.write(annexb)
+                if out_f:
+                    out_f.write(annexb)
+            elif m and m[0] & 0x80 == 0 and (int.from_bytes(m[0:4], 'little') >> 31) & 1:
+                w0 = int.from_bytes(m[0:4], 'little')
+                if (w0 & 0xFF) != 1:
+                    aud += 1
+            if total % 200 == 0:
+                log(f'received {total} msgs ({total/(time.time()-t0):.0f}/s), '
+                    f'video {vid}, other {aud}')
+    except KeyboardInterrupt:
+        pass
+    log(f'total {total} msgs (video {vid}); releasing output')
+    if ff:
+        try:
+            ff.stdin.close()
+        except Exception:
+            pass
+    for h in (raw_f, out_f, wire_f):
+        if h:
+            h.close()
+    B.unclaim(tok, args.endpoint)
+    log('done')
+
+
+if __name__ == '__main__':
+    main()
