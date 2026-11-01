@@ -187,10 +187,14 @@ class Grpc:
 
 def endpoints(tok):
     g = Grpc(tok)
-    msg = pb_str(1, DEVICE_ID) + pb_varint(4, 100)
+    # field1=\x01, field2=deviceId, field4=100 (byte-verified from Resolve)
+    msg = b'\x0a\x01\x01' + pb_str(2, DEVICE_ID) + pb_varint(4, 100)
     st, info, resp = g.call('GetEndpoints', msg)
     if st != 200:
         print(f'GetEndpoints failed: {st} {info}')
+        return
+    if not resp:
+        print('GetEndpoints returned an empty body (device unknown?)')
         return
     pb = pb_parse(resp)
     print('GetEndpoints OK, response fields:')
@@ -522,6 +526,8 @@ def resolve_router(tok=None, rid=None):
     if rid != 'router_0_0000000000000000000000000':
         return rid
     rr = web_rpc(tok or token(), 'GetRouters', {}).get('routers', [])
+    if not rr:
+        sys.exit('no routers found on this account (cloud.blackmagicdesign.com)')
     if len(rr) == 1:
         rt = rr[0]
         set_router(rt['id'], tok)
@@ -553,6 +559,10 @@ def parse_router_flag(argv):
 if __name__ == '__main__':
     cmd = sys.argv[1] if len(sys.argv) > 1 else 'login'
     tok = token()
+    if os.environ.get('BRIDGE_ROUTER'):
+        set_router(os.environ['BRIDGE_ROUTER'], tok)
+    if cmd not in ('login', 'routers'):
+        resolve_router(tok)   # every router-touching command needs a real id
     if cmd == 'login':
         pass
     elif cmd == 'endpoints':
