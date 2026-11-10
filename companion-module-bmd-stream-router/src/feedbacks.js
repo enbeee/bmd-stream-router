@@ -1,5 +1,3 @@
-'use strict'
-
 /**
  * Real input statuses (verified): STATUS_UNCLAIMED, STATUS_INACTIVE
  * (claimed, not streaming), STATUS_ACTIVE (live). Destination endpoints
@@ -10,7 +8,7 @@
 
 const STATUS_CHOICES_NOTE = 'unclaimed / inactive (claimed, idle) / active (live)'
 
-module.exports = function updateFeedbacks(self) {
+export function UpdateFeedbacks(self) {
 	const destChoices = () =>
 		self.endpoints().destinations.map((d) => ({ id: d.id, label: d.name }))
 	const sourceChoices = () =>
@@ -33,8 +31,7 @@ module.exports = function updateFeedbacks(self) {
 			callback: (event) => {
 				const rt = self.routeFor(event.options.destination)
 				return !!rt && rt.source === event.options.source
-			},
-			subscribe: () => self.updateFeedbacks(),
+			}
 		},
 
 		source_live: {
@@ -48,8 +45,7 @@ module.exports = function updateFeedbacks(self) {
 			callback: (event) => {
 				const ep = self.endpoints().sources.find((s) => s.id === event.options.source)
 				return !!ep && ep.status === 'STATUS_ACTIVE'
-			},
-			subscribe: () => self.updateFeedbacks(),
+			}
 		},
 
 		source_claimed: {
@@ -63,8 +59,7 @@ module.exports = function updateFeedbacks(self) {
 			callback: (event) => {
 				const ep = self.endpoints().sources.find((s) => s.id === event.options.source)
 				return !!ep && ep.status === 'STATUS_INACTIVE'
-			},
-			subscribe: () => self.updateFeedbacks(),
+			}
 		},
 
 		gateway_live: {
@@ -78,8 +73,7 @@ module.exports = function updateFeedbacks(self) {
 			callback: (event) => {
 				const ep = self.destinationById(event.options.endpoint)
 				return !!(ep && ep.gateway && ep.gateway.live)
-			},
-			subscribe: () => self.updateFeedbacks(),
+			}
 		},
 
 		gateway_status: {
@@ -93,8 +87,7 @@ module.exports = function updateFeedbacks(self) {
 			callback: (event) => {
 				const ep = self.destinationById(event.options.endpoint)
 				return !!ep && ep.status === 'STATUS_ACTIVE'
-			},
-			subscribe: () => self.updateFeedbacks(),
+			}
 		},
 	})
 }

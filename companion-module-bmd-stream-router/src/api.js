@@ -17,7 +17,7 @@ const CLIENT_ID = 'GXME7NMpelSg0biEqCuLJp8y5k50toDx' // Blackmagic Cloud web app
 const API = 'https://web-api.cloud.blackmagicdesign.com'
 const SVC = 'bmd.cloud.webapi.streaming.v1.StreamRouterService'
 
-class BmdCloudClient {
+export class BmdCloudClient {
 	/**
 	 * @param {object} opts
 	 * @param {string} [opts.refreshToken] OAuth refresh token (single active family - if the
@@ -196,4 +196,3 @@ class BmdCloudClient {
 	}
 }
 
-module.exports = { BmdCloudClient }

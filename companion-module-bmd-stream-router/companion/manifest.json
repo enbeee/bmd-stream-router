@@ -1,0 +1,27 @@
+{
+	"$schema": "../node_modules/@companion-module/base/assets/manifest.schema.json",
+	"type": "connection",
+	"id": "bmd-stream-router",
+	"name": "Blackmagic Cloud Stream Router",
+	"shortname": "bmcloud-router",
+	"description": "Control a Blackmagic Cloud Stream Router: crosspoint routing, Streaming Output destinations and live state, live status feedback",
+	"version": "0.2.0",
+	"license": "MIT",
+	"repository": "git+https://github.com/enbeee/bmd-stream-router.git",
+	"bugs": "https://github.com/enbeee/bmd-stream-router/issues",
+	"maintainers": [
+		{
+			"name": "enbeee"
+		}
+	],
+	"runtime": {
+		"type": "node26",
+		"api": "nodejs-ipc",
+		"apiVersion": "0.0.0",
+		"entrypoint": "../src/main.js"
+	},
+	"legacyIds": [],
+	"manufacturer": "Blackmagic Design",
+	"products": ["Blackmagic Cloud Stream Router"],
+	"keywords": ["blackmagic", "cloud", "streaming", "router", "srt", "rtmp", "video"]
+}

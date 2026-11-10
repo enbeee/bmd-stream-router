@@ -1,5 +1,3 @@
-'use strict'
-
 /**
  * Actions covering the Stream Router user-plane API (see BMD_STREAM_ROUTER.md §5):
  *  - UpdateRoutes   {routerId, upserts|deletions: [{source, destination}]}
@@ -11,7 +9,7 @@
  * Clearing a gateway entirely (gateway: {}) errors upstream - replace configs.
  */
 
-module.exports = function updateActions(self) {
+export function UpdateActions(self) {
 	const destChoices = () =>
 		self.endpoints().destinations.map((d) => ({ id: d.id, label: `${d.name} (${shortId(d.id)})` }))
 	const sourceChoices = () =>

@@ -4,12 +4,13 @@ Controls a Blackmagic Cloud Stream Router from Bitfocus Companion: switch inputs
 outputs, disconnect routes, rename endpoints, and configure Streaming Output services
 (including custom RTMP servers the web UI does not offer).
 
-## Install (dev mode)
+## Install
 
-1. `cd companion-module-bmd-stream-router && npm install`
-2. Copy/symlink this folder into Companion's module search path, or run Companion in dev
-   mode pointing at it (Companion 3: Settings -> Developer -> add module dir), then restart.
-3. Add the "bmd-stream-router" connection.
+The module is packaged for the current Companion module system
+(`companion/manifest.json`, node26 runtime). Either grab a built package
+(`yarn package` / `npm run package` -> `bmd-stream-router-<version>.tgz`) or
+run it from source in dev mode: point Companion's developer module path at
+this folder and restart.
 
 ## Configuration
 

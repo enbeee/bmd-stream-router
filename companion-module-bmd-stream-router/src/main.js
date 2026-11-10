@@ -1,13 +1,13 @@
-'use strict'
+import { InstanceBase, InstanceStatus } from '@companion-module/base'
+import { UpgradeScripts } from './upgrades.js'
+import { UpdateActions } from './actions.js'
+import { UpdateFeedbacks } from './feedbacks.js'
+import { UpdateVariableDefinitions } from './variables.js'
+import { BmdCloudClient } from './api.js'
 
-const { InstanceBase, InstanceStatus, runEntrypoint } = require('@companion-module/base')
-const UpgradeScripts = require('./upgrades')
-const { BmdCloudClient } = require('./api')
-const updateActions = require('./actions')
-const updateFeedbacks = require('./feedbacks')
-const updateVariableDefinitions = require('./variables')
+export { UpgradeScripts }
 
-class StreamRouterInstance extends InstanceBase {
+export default class StreamRouterInstance extends InstanceBase {
 	constructor(internal) {
 		super(internal)
 		this.state = null // last GetAndWatchRouter frame {router: {...}}
@@ -18,11 +18,15 @@ class StreamRouterInstance extends InstanceBase {
 
 	async init(config) {
 		this.config = config
-		this.updateStatus(InstanceStatus.Connecting)
-		await this.connect()
+
+		// export definitions before any async state arrives, so the host never
+		// sees values for undefined variables
 		this.updateActions()
 		this.updateFeedbacks()
 		this.updateVariableDefinitions()
+
+		this.updateStatus(InstanceStatus.Connecting)
+		await this.connect()
 	}
 
 	async connect() {
@@ -39,21 +43,22 @@ class StreamRouterInstance extends InstanceBase {
 			this.routers = routers.routers || []
 			if (!this.routers.length) throw new Error('no Stream Routers on this account')
 
-			this.routerId = this.config.routerId && this.routers.some((r) => r.id === this.config.routerId)
-				? this.config.routerId
-				: this.routers[0].id
+			this.routerId =
+				this.config.routerId && this.routers.some((r) => r.id === this.config.routerId)
+					? this.config.routerId
+					: this.routers[0].id
 
 			if (this.watchHandle) this.watchHandle.close()
 			this.watchHandle = this.client.watchRouter(
 				this.routerId,
 				(frame) => {
 					this.state = frame.router
+					this.updateActions() // refresh dropdown choice lists
 					this.updateFeedbacks()
-					this.updateVariableDefinitions()
 					this.checkFeedbacks()
 					this.setVariableValues(this.collectVariables())
 				},
-				(err) => this.log('warn', `watch stream: ${err.message}`)
+				(err) => this.log('warn', `watch stream: ${err.message}`),
 			)
 			this.updateStatus(InstanceStatus.Ok)
 			this.log('info', `watching router ${this.routerId}`)
@@ -65,7 +70,6 @@ class StreamRouterInstance extends InstanceBase {
 	}
 
 	async configUpdated(config) {
-		const prevRouter = this.config.routerId
 		this.config = config
 		if (this.client) this.client.accessToken = null // force re-auth from new session
 		await this.connect()
@@ -99,11 +103,12 @@ class StreamRouterInstance extends InstanceBase {
 	}
 
 	collectVariables() {
-		const vars = {}
+		const vars = {
+			router_name: (this.state && this.state.name) || '',
+			router_region: (this.state && this.state.region) || '',
+			route_count: String(this.state?.routes?.length ?? 0),
+		}
 		const { sources, destinations } = this.endpoints()
-		vars['router_name'] = (this.state && this.state.name) || ''
-		vars['router_region'] = (this.state && this.state.region) || ''
-		vars['route_count'] = String((this.state && this.state.routes || []).length)
 		destinations.forEach((d, i) => {
 			const rt = this.routeFor(d.id)
 			vars[`dest_${i + 1}_name`] = d.name
@@ -124,7 +129,7 @@ class StreamRouterInstance extends InstanceBase {
 			{
 				type: 'textinput',
 				id: 'session',
-				label: 'bmcloud.authToken cookie value',
+				label: 'Session cookie (bmcloud.authToken value)',
 				tooltip:
 					'Log in at apps.cloud.blackmagicdesign.com, open DevTools > Application > Cookies, copy the value of bmcloud.authToken and paste it here. Contains a refresh token, so it keeps working until you log out.',
 				width: 12,
@@ -139,16 +144,14 @@ class StreamRouterInstance extends InstanceBase {
 	}
 
 	updateActions() {
-		updateActions(this)
+		UpdateActions(this)
 	}
 
 	updateFeedbacks() {
-		updateFeedbacks(this)
+		UpdateFeedbacks(this)
 	}
 
 	updateVariableDefinitions() {
-		updateVariableDefinitions(this)
+		UpdateVariableDefinitions(this)
 	}
 }
-
-runEntrypoint(StreamRouterInstance, UpgradeScripts)
