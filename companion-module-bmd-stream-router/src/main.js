@@ -53,9 +53,17 @@ export default class StreamRouterInstance extends InstanceBase {
 				this.routerId,
 				(frame) => {
 					this.state = frame.router
-					this.updateActions() // refresh dropdown choice lists
-					this.updateFeedbacks()
-					this.checkFeedbacks()
+					// re-define actions/feedbacks only when the choice-relevant
+					// state actually changed: every setActionDefinitions call
+					// makes the host re-subscribe + re-validate all stored
+					// controls, so re-defining per frame floods it
+					const sig = this.stateSignature()
+					if (sig !== this.lastStateSig) {
+						this.lastStateSig = sig
+						this.updateActions()
+						this.updateFeedbacks()
+					}
+					this.checkAllFeedbacks()
 					this.setVariableValues(this.collectVariables())
 				},
 				(err) => this.log('warn', `watch stream: ${err.message}`),
@@ -71,6 +79,7 @@ export default class StreamRouterInstance extends InstanceBase {
 
 	async configUpdated(config) {
 		this.config = config
+		this.lastStateSig = undefined
 		if (this.client) this.client.accessToken = null // force re-auth from new session
 		await this.connect()
 	}
@@ -100,6 +109,22 @@ export default class StreamRouterInstance extends InstanceBase {
 	destinationById(id) {
 		const { destinations } = this.endpoints()
 		return destinations.find((d) => d.id === id) || null
+	}
+
+	/** Signature of everything the action/feedback choices depend on. */
+	stateSignature() {
+		const r = this.state
+		if (!r) return 'null'
+		const ep = (e) => `${e.id}:${e.name}:${e.status}:${e.type}:${
+			e.gateway ? (e.gateway.live ? 1 : 0) : ''
+		}`
+		return JSON.stringify([
+			r.name,
+			r.region,
+			(r.sources || []).map(ep),
+			(r.destinations || []).map(ep),
+			r.routes || [],
+		])
 	}
 
 	collectVariables() {

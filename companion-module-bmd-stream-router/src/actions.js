@@ -36,8 +36,7 @@ export function UpdateActions(self) {
 				} catch (e) {
 					self.log('error', `route failed: ${e.message}`)
 				}
-			},
-			subscribe: () => self.updateActions(), // refresh choice lists when state changes
+			} // refresh choice lists when state changes
 		},
 
 		route_numbers: {
@@ -55,8 +54,7 @@ export function UpdateActions(self) {
 				} catch (e) {
 					self.log('error', `route failed: ${e.message}`)
 				}
-			},
-			subscribe: () => self.updateActions(),
+			}
 		},
 
 		disconnect: {
@@ -70,8 +68,7 @@ export function UpdateActions(self) {
 				} catch (e) {
 					self.log('error', `disconnect failed: ${e.message}`)
 				}
-			},
-			subscribe: () => self.updateActions(),
+			}
 		},
 
 		rename: {
@@ -86,8 +83,7 @@ export function UpdateActions(self) {
 				} catch (e) {
 					self.log('error', `rename failed: ${e.message}`)
 				}
-			},
-			subscribe: () => self.updateActions(),
+			}
 		},
 
 		gateway_live: {
@@ -108,8 +104,7 @@ export function UpdateActions(self) {
 				} catch (e) {
 					self.log('error', `gateway update failed: ${e.message}`)
 				}
-			},
-			subscribe: () => self.updateActions(),
+			}
 		},
 
 		set_sink_provider: {
@@ -130,8 +125,7 @@ export function UpdateActions(self) {
 				} catch (e) {
 					self.log('error', `set sink failed: ${e.message}`)
 				}
-			},
-			subscribe: () => self.updateActions(),
+			}
 		},
 
 		set_sink_custom: {
@@ -152,8 +146,7 @@ export function UpdateActions(self) {
 				} catch (e) {
 					self.log('error', `set sink failed: ${e.message}`)
 				}
-			},
-			subscribe: () => self.updateActions(),
+			}
 		},
 	})
 }

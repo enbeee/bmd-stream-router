@@ -5,7 +5,7 @@
 	"name": "Blackmagic Cloud Stream Router",
 	"shortname": "bmcloud-router",
 	"description": "Control a Blackmagic Cloud Stream Router: crosspoint routing, Streaming Output destinations and live state, live status feedback",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"license": "MIT",
 	"repository": "git+https://github.com/enbeee/bmd-stream-router.git",
 	"bugs": "https://github.com/enbeee/bmd-stream-router/issues",
