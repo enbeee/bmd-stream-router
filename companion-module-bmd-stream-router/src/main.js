@@ -30,6 +30,15 @@ export default class StreamRouterInstance extends InstanceBase {
 	}
 
 	async connect() {
+		// generation guard: a config update or retry overlapping an in-flight
+		// connect must invalidate it, or two watch streams race (the log
+		// symptom was a doubled "watching router" line)
+		if (this.connectTimer) {
+			clearTimeout(this.connectTimer)
+			this.connectTimer = null
+		}
+		const gen = (this.connectGen = (this.connectGen || 0) + 1)
+		const stale = () => gen !== this.connectGen
 		try {
 			if (!this.config.session) throw new Error('no session configured')
 			const parsed = BmdCloudClient.parseAuthCookie(this.config.session.trim())
@@ -40,6 +49,7 @@ export default class StreamRouterInstance extends InstanceBase {
 				log: (level, msg) => this.log(level, msg),
 			})
 			const routers = await this.client.getRouters()
+			if (stale()) return
 			this.routers = routers.routers || []
 			if (!this.routers.length) throw new Error('no Stream Routers on this account')
 
@@ -52,34 +62,45 @@ export default class StreamRouterInstance extends InstanceBase {
 			this.watchHandle = this.client.watchRouter(
 				this.routerId,
 				(frame) => {
-					this.state = frame.router
-					// re-define actions/feedbacks only when the choice-relevant
-					// state actually changed: every setActionDefinitions call
-					// makes the host re-subscribe + re-validate all stored
-					// controls, so re-defining per frame floods it
-					const sig = this.stateSignature()
-					if (sig !== this.lastStateSig) {
-						this.lastStateSig = sig
-						this.updateActions()
-						this.updateFeedbacks()
+					if (stale()) return
+					try {
+						this.state = frame.router
+						// re-define actions/feedbacks only when the choice-relevant
+						// state actually changed: every setActionDefinitions call
+						// makes the host re-subscribe + re-validate all stored
+						// controls, so re-defining per frame floods it
+						const sig = this.stateSignature()
+						if (sig !== this.lastStateSig) {
+							this.lastStateSig = sig
+							this.updateActions()
+							this.updateFeedbacks()
+						}
+						this.checkAllFeedbacks()
+						this.setVariableValues(this.collectVariables())
+					} catch (e) {
+						// never let a bad frame kill the watch stream
+						this.log('error', `state update failed: ${e.message}`)
 					}
-					this.checkAllFeedbacks()
-					this.setVariableValues(this.collectVariables())
 				},
-				(err) => this.log('warn', `watch stream: ${err.message}`),
+				(err) => {
+					if (!stale()) this.log('warn', `watch stream: ${err.message}`)
+				},
 			)
+			if (stale()) return
 			this.updateStatus(InstanceStatus.Ok)
 			this.log('info', `watching router ${this.routerId}`)
 		} catch (e) {
+			if (stale()) return
 			this.updateStatus(InstanceStatus.ConnectionFailure, e.message)
 			this.log('error', e.message)
-			setTimeout(() => this.connect(), 15000)
+			this.connectTimer = setTimeout(() => this.connect(), 15000)
 		}
 	}
 
 	async configUpdated(config) {
 		this.config = config
 		this.lastStateSig = undefined
+		this.connectGen = (this.connectGen || 0) + 1 // invalidate in-flight connects
 		if (this.client) this.client.accessToken = null // force re-auth from new session
 		await this.connect()
 	}

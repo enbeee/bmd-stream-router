@@ -46,6 +46,13 @@ family in the background), refreshes fail — paste a fresh cookie then.
 `dest_N_source_id`, `dest_N_status`. Statuses are `unclaimed` /
 `inactive` (claimed, idle) / `active` (live).
 
+### Switching router or account
+
+Endpoint ids are account/router-scoped. If you connect to a different router
+(or a different BMD account), existing buttons keep their old endpoint values
+and fail with "Value is not in the list of choices" - re-select the endpoint
+in each action/feedback config once.
+
 ### Notes
 
 - Endpoint statuses: `unclaimed` / `inactive` (claimed, not streaming) /
