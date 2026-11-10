@@ -9,7 +9,8 @@ feedback — no Blackmagic hardware needed on the Companion machine.
 1. Log in at https://apps.cloud.blackmagicdesign.com/ in your browser.
 2. DevTools (F12) → Application → Cookies → `apps.cloud.blackmagicdesign.com`.
 3. Copy the value of the **`bmcloud.authToken`** cookie into the module config
-   ("Session cookie").
+   ("Session cookie"). The value is usually URL-encoded (`%7B%22body%22...`) -
+   paste it as-is; the module decodes it automatically.
 4. Router ID: leave blank to use the first router on the account.
 
 **Session caveat:** the cookie carries a single active OAuth refresh-token

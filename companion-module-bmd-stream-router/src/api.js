@@ -35,9 +35,35 @@ export class BmdCloudClient {
 		this.log = opts.log || (() => {})
 	}
 
-	/** Extract the session from a pasted bmcloud.authToken cookie value. */
+	/** Extract the session from a pasted bmcloud.authToken cookie value.
+	 * The web app stores the cookie URL-encoded (the JSON shows as
+	 * %7B..%22..%3A..), so decode before parsing - and tolerate double
+	 * encoding, which is what a copy at the wrong nesting level produces. */
 	static parseAuthCookie(cookieValue) {
-		const outer = JSON.parse(cookieValue)
+		let raw = (cookieValue || '').trim()
+		for (let i = 0; i < 3 && raw.includes('%'); i++) {
+			let decoded
+			try {
+				decoded = decodeURIComponent(raw)
+			} catch (_e) {
+				break // malformed escape - hand the raw value on for a clear error
+			}
+			try {
+				JSON.parse(decoded)
+				raw = decoded
+				break // decoded value is valid JSON - done
+			} catch (_e) {
+				raw = decoded // still not JSON - maybe another encoding layer
+			}
+		}
+		let outer
+		try {
+			outer = JSON.parse(raw)
+		} catch (_e) {
+			throw new Error(
+				'session cookie is not valid JSON (even after URL-decoding) - re-copy the bmcloud.authToken value from DevTools > Application > Cookies'
+			)
+		}
 		const body = outer.body || outer
 		return {
 			accessToken: body.access_token,

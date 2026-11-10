@@ -131,7 +131,7 @@ export default class StreamRouterInstance extends InstanceBase {
 				id: 'session',
 				label: 'Session cookie (bmcloud.authToken value)',
 				tooltip:
-					'Log in at apps.cloud.blackmagicdesign.com, open DevTools > Application > Cookies, copy the value of bmcloud.authToken and paste it here. Contains a refresh token, so it keeps working until you log out.',
+					'Log in at apps.cloud.blackmagicdesign.com, open DevTools > Application > Cookies, copy the value of bmcloud.authToken and paste it here (URL-encoded is fine, the module decodes it). Contains a refresh token, so it keeps working until you log out.',
 				width: 12,
 			},
 			{
