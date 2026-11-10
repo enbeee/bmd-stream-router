@@ -6,11 +6,22 @@ outputs, disconnect routes, rename endpoints, and configure Streaming Output ser
 
 ## Install
 
-The module is packaged for the current Companion module system
-(`companion/manifest.json`, node26 runtime). Either grab a built package
-(`yarn package` / `npm run package` -> `bmd-stream-router-<version>.tgz`) or
-run it from source in dev mode: point Companion's developer module path at
-this folder and restart.
+**From a release package (recommended):** grab
+`bmd-stream-router-<version>.tgz` from this repo's GitHub Releases
+(`yarn package` / `npm run package` regenerates it), then in Companion:
+Connections → Add module → import the file. The package declares
+`runtime.apiVersion 2.1.3` (@companion-module/base 2.1.3), the range
+Companion 5.x accepts for the v2 module contract.
+
+**From source (dev mode):** the API version is read from the installed
+`@companion-module/base`, so dependencies must exist first:
+
+```sh
+cd companion-module-bmd-stream-router && npm install
+```
+
+Then point Companion's developer module path at this folder and restart
+Companion.
 
 ## Configuration
 

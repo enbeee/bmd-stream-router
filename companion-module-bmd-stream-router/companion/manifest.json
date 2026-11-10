@@ -17,11 +17,21 @@
 	"runtime": {
 		"type": "node26",
 		"api": "nodejs-ipc",
-		"apiVersion": "0.0.0",
+		"apiVersion": "2.1.3",
 		"entrypoint": "../src/main.js"
 	},
 	"legacyIds": [],
 	"manufacturer": "Blackmagic Design",
-	"products": ["Blackmagic Cloud Stream Router"],
-	"keywords": ["blackmagic", "cloud", "streaming", "router", "srt", "rtmp", "video"]
+	"products": [
+		"Blackmagic Cloud Stream Router"
+	],
+	"keywords": [
+		"blackmagic",
+		"cloud",
+		"streaming",
+		"router",
+		"srt",
+		"rtmp",
+		"video"
+	]
 }
