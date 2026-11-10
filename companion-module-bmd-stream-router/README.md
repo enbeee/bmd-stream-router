@@ -13,6 +13,21 @@ Connections → Add module → import the file. The package declares
 `runtime.apiVersion 2.1.3` (@companion-module/base 2.1.3), the range
 Companion 5.x accepts for the v2 module contract.
 
+**Headless / remote UI:** Companion disables the "Import Package" buttons for
+web-UI clients that are not on the same machine (installing code over the
+network is a security decision). Either of:
+
+- Restart Companion with `--enable-restricted-modules` (or the env
+  `COMPANION_ENABLE_RESTRICTED_MODULES=1`), import, then remove it again.
+  Note the flag lets *any* remote client install code while it is set.
+- Open the UI from inside the VM (`http://localhost:8000`) — loopback is
+  always allowed.
+- Skip the UI entirely: extract the `.tgz` and drop the contained
+  `bmd-stream-router/` folder into Companion's modules directory as
+  `<config-dir>/modules/bmd-stream-router-0.2.0/`, then restart Companion.
+  The config dir is printed at startup (`configuration directory: …`;
+  on Linux typically `~/.config/companion`).
+
 **From source (dev mode):** the API version is read from the installed
 `@companion-module/base`, so dependencies must exist first:
 
