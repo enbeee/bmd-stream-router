@@ -64,7 +64,21 @@ export default class StreamRouterInstance extends InstanceBase {
 				(frame) => {
 					if (stale()) return
 					try {
-						this.state = frame.router
+						// GetAndWatchRouter sends an initial full snapshot
+						// {router: {...}} followed by INCREMENTAL deltas
+						// {routerUpdate: {id, endpointsUpdate, routesUpdate}}.
+						// Applying deltas onto the kept state is essential:
+						// replacing state with frame.router (undefined on a
+						// delta) wiped the endpoints and every stored action/
+						// feedback instantly failed "not in the list of
+						// choices" - the "button forgets its target" bug.
+						if (frame.router) {
+							this.state = frame.router
+						} else if (frame.routerUpdate) {
+							this.applyRouterUpdate(frame.routerUpdate)
+						} else {
+							return // unknown frame - keep last good state
+						}
 						// re-define actions/feedbacks only when the choice-relevant
 						// state actually changed: every setActionDefinitions call
 						// makes the host re-subscribe + re-validate all stored
@@ -146,6 +160,45 @@ export default class StreamRouterInstance extends InstanceBase {
 			(r.destinations || []).map(ep),
 			r.routes || [],
 		])
+	}
+
+	/** Apply one {routerUpdate} delta frame onto the current state.
+	 * Frame grammar (live-verified): {id, endpointsUpdate: {upserts, deletions},
+	 * routesUpdate: {upserts, deletions}}. Endpoint upserts are routed by their
+	 * type field into sources vs destinations; route upserts are de-duplicated
+	 * on the {source, destination} pair. */
+	applyRouterUpdate(upd) {
+		if (!this.state || !upd || upd.id !== this.state.id) return
+		const eu = upd.endpointsUpdate || {}
+		const upsertEndpoint = (list, e) => {
+			const i = list.findIndex((x) => x.id === e.id)
+			if (i >= 0) list[i] = e
+			else list.push(e)
+		}
+		for (const e of eu.upserts || []) {
+			if (e.type === 'TYPE_SOURCE') {
+				if (!this.state.sources) this.state.sources = []
+				upsertEndpoint(this.state.sources, e)
+			} else {
+				if (!this.state.destinations) this.state.destinations = []
+				upsertEndpoint(this.state.destinations, e)
+			}
+		}
+		const delIds = new Set((eu.deletions || []).map((d) => d.id || d))
+		if (delIds.size) {
+			this.state.sources = (this.state.sources || []).filter((e) => !delIds.has(e.id))
+			this.state.destinations = (this.state.destinations || []).filter((e) => !delIds.has(e.id))
+		}
+		const ru = upd.routesUpdate || {}
+		const routes = this.state.routes || (this.state.routes = [])
+		for (const r of ru.upserts || []) {
+			const i = routes.findIndex((x) => x.source === r.source && x.destination === r.destination)
+			if (i < 0) routes.push(r)
+		}
+		for (const d of ru.deletions || []) {
+			const i = routes.findIndex((x) => x.source === d.source && x.destination === d.destination)
+			if (i >= 0) routes.splice(i, 1)
+		}
 	}
 
 	collectVariables() {
